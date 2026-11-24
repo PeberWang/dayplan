@@ -1802,6 +1802,7 @@ struct BlockRow: View {
                 .foregroundColor(Palette.secondary)
                 .opacity(store.hoveredID == block.id ? 0.4 : 0)
                 .frame(width: 14, height: 14)
+                .allowsHitTesting(store.hoveredID == block.id)   // 透明时不吞掉勾选圈的点击
                 .contentShape(Rectangle())
                 .onTapGesture { store.expandOutcome(block.id) }
                 .help(L.editOutcome)
