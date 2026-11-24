@@ -180,6 +180,32 @@ struct L10n {
     }
     var chooseFolder: String { isZH ? "选择" : "Choose" }
     var aboutLabel: String { isZH ? "关于" : "About" }
+
+    // 更新
+    var updateLabel: String { isZH ? "更新" : "Updates" }
+    var autoUpdateLabel: String { isZH ? "自动检查并更新" : "Check and update automatically" }
+    var checkNow: String { isZH ? "立即检查" : "Check now" }
+    var checking: String { isZH ? "正在检查…" : "Checking…" }
+    var neverUpdated: String { isZH ? "尚未更新" : "never" }
+    var restartToApply: String { isZH ? "已更新，重启后生效" : "Updated — restart to apply" }
+    var updateHint: String {
+        isZH ? "自动更新只对 git 安装生效，其他安装方式请手动更新"
+             : "Automatic updates work for git installs; update other installs by hand."
+    }
+    var restartNow: String { isZH ? "重启以应用更新" : "Restart to apply update" }
+    func versionLine(_ v: String, _ last: String) -> String {
+        isZH ? "当前版本 \(v) · 上次更新 \(last)"
+             : "Version \(v) · last update \(last)"
+    }
+    func updateOutcome(_ o: UpdateStore.Outcome) -> String {
+        switch o {
+        case .upToDate: return isZH ? "已是最新" : "Already up to date"
+        case .updating: return isZH ? "发现新版，正在更新" : "New version found — updating"
+        case .updated: return restartToApply
+        case .failed: return isZH ? "检查或更新失败，详见日志" : "Check or update failed — see the log"
+        case .noGit: return isZH ? "未通过 git 安装，请手动更新" : "Not a git install — update manually"
+        }
+    }
     func langName(_ s: LangSource) -> String {
         switch s {
         case .system: return followSystem
@@ -215,12 +241,15 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var language: LangSource
     @Published private(set) var dataDirText: String     // 当前生效的目录
     @Published private(set) var envDirActive: Bool      // DAYPLAN_DIR 是否在生效
+    @Published private(set) var autoUpdate: Bool        // v9：自动检查并更新，默认开
 
     private init() {
         language = LangSource.stored()
         let env = ProcessInfo.processInfo.environment
         envDirActive = !(env["DAYPLAN_DIR"] ?? "").isEmpty
         dataDirText = PlanIO.resolveDir().path
+        // 没写过就是开。显式写 false 才算关。
+        autoUpdate = SettingsStore.storedBool("autoUpdate", default: true)
     }
 
     var l10n: L10n { L10n.from(language) }
@@ -244,11 +273,360 @@ final class SettingsStore: ObservableObject {
         envDirActive = !(env["DAYPLAN_DIR"] ?? "").isEmpty
         dataDirText = PlanIO.resolveDir().path
     }
+
+    func setAutoUpdate(_ on: Bool) {
+        guard on != autoUpdate else { return }
+        autoUpdate = on
+        UpdateStore.setPref("autoUpdate", on)
+    }
+
+    // 直接跑二进制（不在 .app 里）时 standard 可能读不到应用自己的 domain，再按 bundle id 读一次。
+    static func storedBool(_ key: String, default def: Bool) -> Bool {
+        if let v = UserDefaults.standard.object(forKey: key) as? Bool { return v }
+        let id = Bundle.main.bundleIdentifier ?? "io.github.peberwang.dayplan"
+        if let v = UserDefaults(suiteName: id)?.object(forKey: key) as? Bool { return v }
+        return def
+    }
 }
 
 // 全局只留一个「取当前语言」的入口给非视图代码（写入错误、日期格式、字体、菜单）。
 // 视图不再直接用它：各自从 SettingsStore 取，才能跟着切换刷新。
 var L: L10n { SettingsStore.shared.l10n }
+
+// MARK: - 版本与自动更新
+
+enum AppVersion {
+    // 构建时写入：Info.plist 缺 CFBundleShortVersionString 时用它。发布时与 VERSION 一起改。
+    static let fallback = "0.9.0"
+
+    static var current: String {
+        if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { return t }
+        }
+        return fallback
+    }
+
+    // 语义化比较：逐段转 Int，缺段补 0，非数字段按 0；返回 1 / 0 / -1。
+    // 不能用字符串比较——"0.10.0" 会排在 "0.9.0" 前面。
+    static func compare(_ a: String, _ b: String) -> Int {
+        func parts(_ s: String) -> [Int] {
+            s.split(separator: ".").map { seg in
+                Int(seg.prefix { $0.isNumber }) ?? 0
+            }
+        }
+        let x = parts(a), y = parts(b)
+        for i in 0..<max(x.count, y.count) {
+            let vx = i < x.count ? x[i] : 0
+            let vy = i < y.count ? y[i] : 0
+            if vx != vy { return vx > vy ? 1 : -1 }
+        }
+        return 0
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool { compare(a, b) > 0 }
+}
+
+extension Notification.Name {
+    static let dayplanUpdateStateChanged = Notification.Name("io.github.peberwang.dayplan.updateStateChanged")
+}
+
+// v9：自动更新。只认「git 克隆后跑 scripts/install.sh」装上的那一份——install.sh 把仓库
+// 绝对路径写进 UserDefaults 的 installRepo。流程：fetch → 比 origin/master → pull --ff-only
+// → scripts/install.sh；任何一步失败都只写 ~/Library/Logs/DayPlan-update.log，不动现有安装、
+// 不弹窗、不重试。替换成功后只置 pendingRestart，重启与否交给用户。
+final class UpdateStore: ObservableObject {
+    static let shared = UpdateStore()
+
+    static let remoteVersionURL = URL(string: "https://raw.githubusercontent.com/PeberWang/dayplan/master/VERSION")!
+    static var bundleID: String { Bundle.main.bundleIdentifier ?? "io.github.peberwang.dayplan" }
+
+    enum Phase: Equatable { case idle, checking, upToDate, updating, updated, failed, noGit }
+    enum Outcome: Equatable { case upToDate, updating, updated, failed, noGit }
+
+    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var lastOutcome: Outcome?
+    @Published private(set) var pendingRestart: Bool = false
+    @Published private(set) var lastUpdatedAt: Date?
+
+    private let queue = DispatchQueue(label: "io.github.peberwang.dayplan.updater", qos: .utility)
+    private var running = false
+    private var timer: Timer?
+    private let launchedAt = Date()
+
+    private init() {
+        let stamp = Self.pref("lastUpdatedAt") as? Double
+        lastUpdatedAt = stamp.map { Date(timeIntervalSince1970: $0) }
+        var pending = Self.pref("pendingRestart") as? Bool ?? false
+        // 更新是在上一个进程里完成的：这次启动已经在跑新二进制，提示可以撤掉了。
+        if pending, let t = lastUpdatedAt, t < launchedAt {
+            pending = false
+            Self.setPref("pendingRestart", false)
+        }
+        pendingRestart = pending
+    }
+
+    var installRepo: String? {
+        guard let s = Self.pref("installRepo") as? String else { return nil }
+        let t = (s as NSString).expandingTildeInPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    var lastUpdatedText: String? {
+        guard let d = lastUpdatedAt else { return nil }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: d)
+    }
+
+    // MARK: 时机
+
+    // 启动 30 秒后一次，之后每 24 小时一次。DAYPLAN_UPDATE_DELAY 可缩短首检（测试用）。
+    func startScheduling() {
+        guard timer == nil else { return }
+        let delay = ProcessInfo.processInfo.environment["DAYPLAN_UPDATE_DELAY"].flatMap(Double.init) ?? 30
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.autoCheck()
+        }
+        let t = Timer(timeInterval: 24 * 60 * 60, repeats: true) { [weak self] _ in
+            self?.autoCheck()
+        }
+        t.tolerance = 300
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
+    func checkNow() {
+        guard !running else { return }
+        running = true
+        begin(manual: true)
+    }
+
+    private func autoCheck() {
+        guard SettingsStore.shared.autoUpdate, !running else { return }
+        running = true
+        Self.appendLog("check: auto, version \(AppVersion.current)")
+        begin(manual: false)
+    }
+
+    private func begin(manual: Bool) {
+        if manual {
+            lastOutcome = nil
+            phase = .checking
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            let result = self.performCheck(manual: manual)
+            DispatchQueue.main.async {
+                self.phase = result.phase
+                self.lastOutcome = result.outcome
+                self.lastUpdatedAt = (Self.pref("lastUpdatedAt") as? Double)
+                    .map { Date(timeIntervalSince1970: $0) }
+                self.pendingRestart = Self.pref("pendingRestart") as? Bool ?? false
+                self.running = false
+                NotificationCenter.default.post(name: .dayplanUpdateStateChanged, object: nil)
+            }
+        }
+    }
+
+    // MARK: 流程（后台队列）
+
+    private func performCheck(manual: Bool) -> (phase: Phase, outcome: Outcome?) {
+        let version = AppVersion.current
+        let failPhase: Phase = manual ? .failed : .idle
+
+        guard let repo = installRepo else {
+            Self.appendLog("skip: installRepo 未设置（不是 git 安装），version \(version)")
+            return (manual ? .noGit : .idle, manual ? .noGit : nil)
+        }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: repo, isDirectory: &isDir),
+              isDir.boolValue,
+              FileManager.default.fileExists(atPath: repo + "/.git"),
+              let git = Self.gitPath()
+        else {
+            Self.appendLog("skip: 仓库不存在或不是 git 仓库（不是 git 安装）→ \(repo)")
+            return (manual ? .noGit : .idle, manual ? .noGit : nil)
+        }
+
+        // 1. fetch（只抓 origin，不碰用户配置的其他 remote）
+        let fetch = run(git, ["-C", repo, "fetch", "--quiet", "origin"], timeout: 90)
+        guard fetch.code == 0 else {
+            Self.appendLog("fetch failed (\(fetch.code)): \(oneLine(fetch.out))")
+            return (failPhase, manual ? .failed : nil)
+        }
+
+        // 2. 版本：本地 Info.plist vs 仓库里的 VERSION
+        let remoteVersion = fetchRemoteVersion()
+        let newer = remoteVersion.map { AppVersion.isNewer($0, than: version) } ?? false
+
+        // 3. 提交：HEAD vs origin/master（仓库用 main 时退回 origin/main）
+        var branch = "origin/master"
+        if run(git, ["-C", repo, "rev-parse", "--verify", "--quiet", branch]).code != 0 {
+            if run(git, ["-C", repo, "rev-parse", "--verify", "--quiet", "origin/main"]).code == 0 {
+                branch = "origin/main"
+            }
+        }
+        let head = run(git, ["-C", repo, "rev-parse", "HEAD"]).out.trimmed
+        let remoteHead = run(git, ["-C", repo, "rev-parse", branch]).out.trimmed
+        var behind = 0
+        let count = run(git, ["-C", repo, "rev-list", "--count", "HEAD..\(branch)"])
+        if count.code == 0 { behind = Int(count.out.trimmed) ?? 0 }
+
+        Self.appendLog("check: version \(version) remote \(remoteVersion ?? "?") head \(short(head)) \(branch) \(short(remoteHead)) behind \(behind) newer \(newer)")
+
+        guard behind > 0 || newer else {
+            return (manual ? .upToDate : .idle, manual ? .upToDate : nil)
+        }
+
+        if manual {
+            DispatchQueue.main.async { self.phase = .updating }
+        }
+
+        // 4. 只快进；本地有改动或网络有问题就放弃本轮
+        let pull = run(git, ["-C", repo, "pull", "--ff-only", "--quiet"], timeout: 180)
+        guard pull.code == 0 else {
+            Self.appendLog("pull failed (\(pull.code)), 保留现有安装: \(oneLine(pull.out))")
+            return (failPhase, manual ? .failed : nil)
+        }
+
+        // 5. 重新编译安装；脚本自己保证编译失败时不动旧二进制
+        let script = repo + "/scripts/install.sh"
+        guard FileManager.default.fileExists(atPath: script) else {
+            Self.appendLog("install.sh 不存在: \(script)")
+            return (failPhase, manual ? .failed : nil)
+        }
+        let install = run("/bin/zsh", [script], cwd: URL(fileURLWithPath: repo), timeout: 900)
+        guard install.code == 0 else {
+            Self.appendLog("install failed (\(install.code)), 旧二进制保留:\n\(tail(install.out))")
+            return (failPhase, manual ? .failed : nil)
+        }
+
+        Self.appendLog("updated ok: \(oneLine(install.out))")
+
+        // 版本号可能先于代码更新（VERSION 推了、代码没推），此时重装不会带来任何变化，
+        // 不谎报「已更新」：提交没前进、装好的版本也和当前一样，就当已是最新。
+        let headAfter = run(git, ["-C", repo, "rev-parse", "HEAD"]).out.trimmed
+        let installed = Self.installedVersion()
+        if headAfter == head, let installed, installed == version {
+            Self.appendLog("install 完成但提交与版本都没变，不提示重启")
+            return (manual ? .upToDate : .idle, manual ? .upToDate : nil)
+        }
+
+        Self.setPref("lastUpdatedAt", Date().timeIntervalSince1970)
+        Self.setPref("pendingRestart", true)
+        return (.updated, manual ? .updated : nil)
+    }
+
+    private static func installedVersion() -> String? {
+        let app = ("~/Applications/DayPlan.app" as NSString).expandingTildeInPath
+        guard let b = Bundle(path: app) else { return nil }
+        return b.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    }
+
+    private func fetchRemoteVersion() -> String? {
+        var req = URLRequest(url: Self.remoteVersionURL)
+        req.timeoutInterval = 20
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let sem = DispatchSemaphore(value: 0)
+        var text: String?
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            defer { sem.signal() }
+            guard let data,
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let s = String(data: data, encoding: .utf8)
+            else { return }
+            text = s.split(separator: "\n").first.map(String.init)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }.resume()
+        _ = sem.wait(timeout: .now() + 25)
+        return (text?.isEmpty ?? true) ? nil : text
+    }
+
+    // MARK: 进程与日志
+
+    private struct RunResult { let code: Int32; let out: String }
+
+    private func run(_ executable: String, _ args: [String],
+                     cwd: URL? = nil, timeout: TimeInterval = 120) -> RunResult {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: executable)
+        p.arguments = args
+        if let cwd { p.currentDirectoryURL = cwd }
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = pipe
+        do {
+            try p.run()
+        } catch {
+            return RunResult(code: -1, out: "launch failed: \(error.localizedDescription)")
+        }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) {
+            if p.isRunning { p.terminate() }
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return RunResult(code: p.terminationStatus, out: String(data: data, encoding: .utf8) ?? "")
+    }
+
+    private static func gitPath() -> String? {
+        for p in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"]
+        where FileManager.default.isExecutableFile(atPath: p) {
+            return p
+        }
+        return nil
+    }
+
+    private func oneLine(_ s: String) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "\n", with: " ⏎ ")
+        return t.count > 600 ? String(t.prefix(600)) + "…" : t
+    }
+
+    private func tail(_ s: String, _ n: Int = 2000) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.count > n ? "…" + String(t.suffix(n)) : t
+    }
+
+    private func short(_ sha: String) -> String {
+        sha.isEmpty ? "?" : String(sha.prefix(7))
+    }
+
+    private static func appendLog(_ text: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        guard let data = "\(ts) \(text)\n".data(using: .utf8) else { return }
+        let fm = FileManager.default
+        let dir = fm.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs")
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        let url = dir.appendingPathComponent("DayPlan-update.log")
+        if let h = try? FileHandle(forWritingTo: url) {
+            h.seekToEndOfFile()
+            h.write(data)
+            try? h.close()
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    // 只跑二进制（不在 .app 里）时 standard 可能读不到应用自己的 domain，再按 bundle id 读一次。
+    static func pref(_ key: String) -> Any? {
+        if let v = UserDefaults.standard.object(forKey: key) { return v }
+        return UserDefaults(suiteName: bundleID)?.object(forKey: key)
+    }
+
+    static func setPref(_ key: String, _ value: Any) {
+        UserDefaults.standard.set(value, forKey: key)
+        UserDefaults(suiteName: bundleID)?.set(value, forKey: key)
+    }
+}
+
+private extension String {
+    var trimmed: String { trimmingCharacters(in: .whitespacesAndNewlines) }
+}
 
 // MARK: - 日期与数字
 
@@ -2606,6 +2984,7 @@ struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     let onLanguageChange: () -> Void
     let onDataDirChange: (URL) -> Void
+    @ObservedObject var updates = UpdateStore.shared
 
     private let repoURL = URL(string: "https://github.com/PeberWang/dayplan")!
 
@@ -2661,6 +3040,42 @@ struct SettingsView: View {
                 .foregroundColor(Palette.done)
                 .padding(.top, 5)
 
+            // 更新（v9）
+            Text(L.updateLabel)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(Palette.ink)
+                .padding(.top, 20)
+                .padding(.bottom, 7)
+
+            Toggle(isOn: Binding(get: { settings.autoUpdate },
+                                 set: { settings.setAutoUpdate($0) })) {
+                Text(L.autoUpdateLabel)
+                    .font(.system(size: 12))
+                    .foregroundColor(Palette.ink)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            HStack(spacing: 8) {
+                Text(L.versionLine(AppVersion.current, updates.lastUpdatedText ?? L.neverUpdated))
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Palette.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                Spacer(minLength: 4)
+                Button(L.checkNow) { updates.checkNow() }
+                    .controlSize(.small)
+                    .disabled(updates.phase == .checking)
+            }
+            .padding(.top, 6)
+
+            Text(updateStatusText(L))
+                .font(.system(size: 11))
+                .foregroundColor(updates.pendingRestart ? Palette.time : Palette.done)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.top, 4)
+
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(L.aboutLabel)
                     .font(.system(size: 13, weight: .medium))
@@ -2681,9 +3096,17 @@ struct SettingsView: View {
         .padding(.horizontal, 22)
         .padding(.top, 20)
         .padding(.bottom, 16)
-        .frame(width: 460, height: 300, alignment: .topLeading)
+        .frame(width: 460, height: 400, alignment: .topLeading)
         .background(Palette.paper)
         .environment(\.colorScheme, .light)
+    }
+
+    // 更新状态一行：检查中 > 已更新待重启 > 最近一次手动检查结果 > 说明
+    private func updateStatusText(_ L: L10n) -> String {
+        if updates.phase == .checking { return L.checking }
+        if updates.pendingRestart { return L.restartToApply }
+        if let o = updates.lastOutcome { return L.updateOutcome(o) }
+        return L.updateHint
     }
 
     // 在 Finder 里定位到当前目录；目录被删了就打开它的上一层。
@@ -2735,6 +3158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var statusStatsItem: NSMenuItem?
     private var statusSettingsItem: NSMenuItem?
     private var statusQuitItem: NSMenuItem?
+    private var statusRestartItem: NSMenuItem?
+    private var statusRestartSeparator: NSMenuItem?
     private var keyMonitor: Any?
     private var mouseMonitor: Any?
     private var outcomeDownOutside: String?   // 记录区开着时，这次点击落在框外的那一条
@@ -2763,6 +3188,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         buildWindow()
         buildStatusItem()
         store.startWatching()
+
+        NotificationCenter.default.addObserver(forName: .dayplanUpdateStateChanged,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.refreshUpdateIndicators()
+        }
+        UpdateStore.shared.startScheduling()
 
         NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification,
                                                object: window, queue: .main) { _ in
@@ -2924,7 +3355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 300),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 400),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = L.settingsTitle
@@ -2934,8 +3365,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.backgroundColor = Palette.paperNS
         w.isMovableByWindowBackground = true
         w.appearance = NSAppearance(named: .aqua)
-        w.contentMinSize = NSSize(width: 460, height: 300)
-        w.contentMaxSize = NSSize(width: 460, height: 300)
+        w.contentMinSize = NSSize(width: 460, height: 400)
+        w.contentMaxSize = NSSize(width: 460, height: 400)
 
         let root = SettingsView(settings: settings,
                                 onLanguageChange: { [weak self] in self?.refreshLocalizedTitles() },
@@ -2952,11 +3383,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         statusStatsItem?.title = L.statsMenu
         statusSettingsItem?.title = L.settingsMenu
         statusQuitItem?.title = L.quit
+        statusRestartItem?.title = L.restartNow
         settingsWindow?.title = L.settingsTitle
         // errorText 是写入时定下的字符串，重读一遍让它跟着语言走。
         ActiveEditor.commitNow()
         ActiveOutcome.commitNow()
         store?.reload()
+        refreshUpdateIndicators()
     }
 
     // 数据目录换了：Store 的 dir 是 let，所以换一个 Store，再把宿主视图的 rootView 换掉。
@@ -3153,6 +3586,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         menu.delegate = self
         menu.autoenablesItems = false
 
+        // 更新装好后出现，平时隐藏：不强制重启，用户自己点。
+        let restart = NSMenuItem(title: L.restartNow, action: #selector(restartToApply), keyEquivalent: "")
+        restart.target = self
+        restart.isHidden = true
+        menu.addItem(restart)
+        let restartSep = NSMenuItem.separator()
+        restartSep.isHidden = true
+        menu.addItem(restartSep)
+
         let toggle = NSMenuItem(title: L.showWindow, action: #selector(toggleWindow), keyEquivalent: "")
         toggle.target = self
         menu.addItem(toggle)
@@ -3179,6 +3621,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         statusStatsItem = statsItem
         statusSettingsItem = settingsItem
         statusQuitItem = quitItem
+        statusRestartItem = restart
+        statusRestartSeparator = restartSep
+        refreshUpdateIndicators()
+    }
+
+    // 已更新待重启：菜单栏图标文字与菜单项都提示一句，不弹窗、不强退。
+    private func refreshUpdateIndicators() {
+        let pending = UpdateStore.shared.pendingRestart
+        statusItem?.button?.toolTip = pending ? "DayPlan · \(L.restartToApply)" : "DayPlan"
+        statusRestartItem?.title = L.restartNow
+        statusRestartItem?.isHidden = !pending
+        statusRestartSeparator?.isHidden = !pending
+    }
+
+    @objc private func restartToApply() {
+        // 先起一个 1 秒后打开新实例的 shell，再退出自己：新进程的「只允许一份」检查才不会被自己挡住。
+        let path = Bundle.main.bundlePath
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 1; /usr/bin/open -n \"$1\"", "sh", path]
+        try? p.run()
+        NSApp.terminate(nil)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
