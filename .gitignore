@@ -1,0 +1,7 @@
+DayPlan
+makeicon
+*.png
+!assets/*.png
+*.orig
+*.bak
+.DS_Store
