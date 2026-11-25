@@ -131,23 +131,17 @@ struct L10n {
     var emptyBlock: String { isZH ? "（空）" : "(empty)" }
     var noPlan: String { isZH ? "还没有今天的计划" : "No plan for today" }
     var reload: String { isZH ? "重新读取" : "Reload" }
-    var readOnly: String { isZH ? "只读" : "Read-only" }
-    var readOnlyHistory: String { isZH ? "历史记录，只读" : "Historical record, read-only" }
-    var weekHint: String { isZH ? "点某一天回去看当天详情；今天的条目可以在窗口里直接改"
-                              : "Click a day to review it. Today's items can be edited here." }
+    var readOnlyHistory: String { isZH ? "这条记录读取失败，暂时不能改" : "Couldn't read this record" }
+    var noDayPlan: String { isZH ? "这一天还没有计划，写下第一条即可"
+                                 : "No plan for this day yet — write the first item." }
+    var weekHint: String { isZH ? "点某一天回去看当天详情；任何一天的条目都能直接改"
+                              : "Click a day to open it; items are editable for any day." }
 
     func parseFailed(_ file: String) -> String {
         isZH ? "今日文件解析失败：\(file)" : "Couldn't read today's file: \(file)"
     }
     func writeFailed(_ msg: String) -> String {
         isZH ? "写入失败：\(msg)" : "Couldn't save: \(msg)"
-    }
-    func readOnlyBanner(_ date: String, _ weekday: String) -> String {
-        isZH ? "只读 · \(date) \(weekday) 的记录" : "Read-only · \(weekday), \(date)"
-    }
-    func fallbackBanner(_ date: String, _ weekday: String) -> String {
-        isZH ? "今天还没有计划 · 下面是 \(date) \(weekday) 的记录"
-             : "No plan for today · showing \(weekday), \(date)"
     }
     func footerDone(_ done: String, _ total: String) -> String {
         isZH ? "完成 \(done) / \(total) 项" : "\(done) / \(total) done"
@@ -388,7 +382,7 @@ var L: L10n { SettingsStore.shared.l10n }
 
 enum AppVersion {
     // 构建时写入：Info.plist 缺 CFBundleShortVersionString 时用它。发布时与 VERSION 一起改。
-    static let fallback = "0.11.0"
+    static let fallback = "0.12.0"
 
     static var current: String {
         if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
@@ -1039,6 +1033,13 @@ enum PlanIO {
          "footer": "", "updated_at": Store.stamp()]
     }
 
+    // 新建当天文件后把 latest.json 重新指过去（相对软链，和已有安装一致）。
+    static func touchLatest(_ key: String, in dir: URL) {
+        let link = dir.appendingPathComponent("latest.json")
+        try? fm.removeItem(at: link)
+        try? fm.createSymbolicLink(atPath: link.path, withDestinationPath: "\(key).json")
+    }
+
     // 写前留一份 <date>.prev.json，再写同目录临时文件后 rename 覆盖：
     // 读到的一定是完整的旧版或新版，不会看到半截。
     static func write(_ root: [String: Any], to url: URL, backup: Bool = true) throws {
@@ -1076,7 +1077,6 @@ final class Store: ObservableObject {
     @Published private(set) var days: [DayDigest] = []
     @Published private(set) var todayKey = ""
     @Published private(set) var todayDay: DayData?      // 仅当 todayKey 那天有文件
-    @Published private(set) var fallbackDay: DayData?   // 今天没文件时，显示 latest.json 指向的那份
     @Published private(set) var weekDone = 0
     @Published private(set) var weekTotal = 0
     @Published var mode: Mode = .day
@@ -1235,17 +1235,17 @@ final class Store: ObservableObject {
         }
         days = digests
         todayDay = today
-        fallbackDay = today == nil ? loadFallback(excluding: k) : nil
         weekDone = digests.compactMap { $0.day?.doneCount }.reduce(0, +)
         weekTotal = digests.compactMap { $0.day?.blocks.count }.reduce(0, +)
 
-        if let v = viewingKey, !digests.contains(where: { $0.key == v && $0.day != nil }) {
+        // 空日子也在近七天里，照样能点进去；只有日期彻底不在窗口内才退回今天。
+        if let v = viewingKey, !digests.contains(where: { $0.key == v }) {
             viewingKey = nil
         }
         if let s = selectedID, !(shownDay?.blocks.contains { $0.id == s } ?? false) {
             selectedID = nil
         }
-        if let k = undoDayKey, k != todayKey {
+        if let k = undoDayKey, k != shownKey {
             undoBlocks = nil
             undoSelection = nil
             undoDayKey = nil
@@ -1257,22 +1257,15 @@ final class Store: ObservableObject {
             expandedOutcome = nil
         }
         if let d = todayDay {
-            errorText = nil
             stats?.upsert(todayKey, total: d.blocks.count, done: d.doneCount)
-        } else if digests.first?.broken == true {
-            errorText = L.parseFailed("\(k).json")
+        }
+        if let shown = shownDigest, shown.broken {
+            errorText = L.parseFailed("\(shown.key).json")
         } else {
-            errorText = L.noPlan
+            errorText = nil
         }
         signature = currentSignature()
         refreshNowClock()
-    }
-
-    private func loadFallback(excluding key: String) -> DayData? {
-        guard let l = latestURL else { return nil }
-        let lk = l.deletingPathExtension().lastPathComponent
-        guard lk != key else { return nil }
-        return loadDay(lk, weekday: DateText.weekday(lk), isToday: false, migrate: false).day
     }
 
     // MARK: 当前时段
@@ -1291,8 +1284,7 @@ final class Store: ObservableObject {
     }
 
     private func refreshNowClock() {
-        let should = mode == .day && editable && !statsVisible
-        if should {
+        if nowActive {
             if nowTimer == nil { startNowClock() }
             recalcNow()
         } else {
@@ -1320,7 +1312,7 @@ final class Store: ObservableObject {
 
     // 每分钟、文件重载、回到前台都会走这里；状态没变就不发布，少刷界面。
     private func recalcNow() {
-        guard nowTimer != nil, mode == .day, editable, let day = todayDay else {
+        guard nowActive, let day = todayDay else {
             if !nowStates.isEmpty { nowStates = [:] }
             return
         }
@@ -1337,25 +1329,41 @@ final class Store: ObservableObject {
 
     // MARK: 展示状态
 
+    // 当前显示的那一天：一周视图点进来的历史日期，否则是今天。
+    var shownKey: String { viewingKey ?? todayKey }
+
+    var shownDigest: DayDigest? { days.first(where: { $0.key == shownKey }) }
+
+    // 还没建文件的日子给一份空白模型：可看、可点「添加」，第一次写入时才落盘。
+    // 文件存在但解析失败时返回 nil，交给空状态显示错误，避免覆盖坏文件。
     var shownDay: DayData? {
-        if let k = viewingKey { return days.first(where: { $0.key == k })?.day }
-        return todayDay ?? fallbackDay
+        if let d = shownDigest?.day { return d }
+        if shownDigest?.broken == true { return nil }
+        return emptyDay(shownKey)
     }
 
-    var shownIsToday: Bool { viewingKey == nil && todayDay != nil }
-    var isHistorical: Bool { viewingKey != nil }
+    private func emptyDay(_ key: String) -> DayData {
+        DayData(key: key,
+                url: PlanIO.fileURL(key, in: dir),
+                raw: PlanIO.newDayRoot(key),
+                weekday: DateText.weekday(key),
+                footer: "",
+                blocks: [])
+    }
 
-    // 只有今天的文件可以改；历史日期与 latest 兜底都只读。
-    var editable: Bool { viewingKey == nil && todayDay != nil && todayDay?.key == todayKey }
+    var shownIsToday: Bool { shownKey == todayKey }
+    var isHistorical: Bool { shownKey != todayKey }
 
+    // 显示中的那天只要文件能读就能改：今天和历史一视同仁；文件不存在则第一次操作时新建。
+    var editable: Bool { shownDigest?.broken != true }
+
+    // 当前时段只对今天算；看历史日期时停表，圆点保持常态。
+    var nowActive: Bool { mode == .day && shownIsToday && editable && !statsVisible && todayDay != nil }
+
+    // 文件还不存在时给一句提示；只读横幅已经取消。
     var banner: String? {
-        if let k = viewingKey {
-            return L.readOnlyBanner(DateText.monthDay(k), DateText.weekday(k))
-        }
-        if todayDay == nil, let f = fallbackDay {
-            return L.fallbackBanner(DateText.monthDay(f.key), DateText.weekday(f.key))
-        }
-        return nil
+        guard shownDigest?.day == nil, shownDigest?.broken != true else { return nil }
+        return L.noDayPlan
     }
 
     var canUndo: Bool { editable && undoBlocks != nil }
@@ -1378,7 +1386,7 @@ final class Store: ObservableObject {
     }
 
     func openDay(_ key: String) {
-        guard days.contains(where: { $0.key == key && $0.day != nil }) else { return }
+        guard days.contains(where: { $0.key == key }) else { return }
         finishEditing()
         selectedID = nil
         viewingKey = (key == todayKey) ? nil : key
@@ -1406,7 +1414,7 @@ final class Store: ObservableObject {
     func commitEdit(_ target: EditTarget, value: String) {
         editing = nil
         refreshIfChanged()
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]],
               let i = blocks.firstIndex(where: { Raw.string($0, "id") == target.blockID }) else { return }
 
@@ -1450,7 +1458,7 @@ final class Store: ObservableObject {
         editing = nil
         guard let target = id, target == pendingNewID else { return }
         pendingNewID = nil
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]],
               let i = blocks.firstIndex(where: { Raw.string($0, "id") == target }) else { return }
         blocks.remove(at: i)
@@ -1461,7 +1469,7 @@ final class Store: ObservableObject {
     func toggle(_ id: String) {
         finishEditing()
         refreshIfChanged()
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]],
               let i = blocks.firstIndex(where: { Raw.string($0, "id") == id }) else { return }
         blocks[i]["done"] = !Raw.bool(blocks[i], "done")
@@ -1471,7 +1479,7 @@ final class Store: ObservableObject {
     func addBlock() {
         finishEditing()
         refreshIfChanged()
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]] else { return }
         let id = Store.newID()
         blocks.append(["id": id, "origin": "user", "time": "", "units": 1,
@@ -1486,21 +1494,21 @@ final class Store: ObservableObject {
     func deleteSelected() {
         finishEditing()
         refreshIfChanged()
-        guard editable, let id = selectedID, let day = todayDay,
+        guard editable, let id = selectedID, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]],
               let i = blocks.firstIndex(where: { Raw.string($0, "id") == id }) else { return }
         let snapshot = blocks
         blocks.remove(at: i)
         undoBlocks = snapshot
         undoSelection = id
-        undoDayKey = todayKey
+        undoDayKey = shownKey
         selectedID = nil
         applyBlocks(blocks, keepUndo: true)
     }
 
     func undoDelete() {
         finishEditing()
-        guard editable, let snap = undoBlocks, undoDayKey == todayKey else {
+        guard editable, let snap = undoBlocks, undoDayKey == shownKey else {
             undoBlocks = nil
             undoSelection = nil
             undoDayKey = nil
@@ -1516,7 +1524,7 @@ final class Store: ObservableObject {
     func move(_ id: String, by delta: Int) {
         finishEditing()
         refreshIfChanged()
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               var blocks = day.raw["blocks"] as? [[String: Any]],
               let i = blocks.firstIndex(where: { Raw.string($0, "id") == id }) else { return }
         let j = i + delta
@@ -1528,7 +1536,7 @@ final class Store: ObservableObject {
     }
 
     func canMove(_ id: String, by delta: Int) -> Bool {
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               let i = day.blocks.firstIndex(where: { $0.id == id }) else { return false }
         return day.blocks.indices.contains(i + delta)
     }
@@ -1549,12 +1557,12 @@ final class Store: ObservableObject {
         if editing != nil { editing = nil }
         ActiveOutcome.commitNow()   // 上一条还开着：先存好、收起来
         // 提交行内编辑可能顺手删掉了刚建的空条目，这里要重新确认
-        guard editable, let day = todayDay,
+        guard editable, let day = shownDay,
               day.blocks.contains(where: { $0.id == id }) else {
             if expandedOutcome != nil { expandedOutcome = nil }
             return
         }
-        outcomeDayKey = todayKey
+        outcomeDayKey = shownKey
         outcomeDayURL = day.url
         outcomeEditorHeight = Layout.outcomeMinHeight
         expandedOutcome = id
@@ -1586,7 +1594,7 @@ final class Store: ObservableObject {
     func saveOutcome(_ id: String, _ text: String) -> Bool {
         let v = text.trimmingCharacters(in: .whitespacesAndNewlines)
         refreshIfChanged()
-        if let day = todayDay, editable, outcomeDayKey == nil || outcomeDayKey == day.key {
+        if let day = shownDay, editable, outcomeDayKey == nil || outcomeDayKey == day.key {
             guard var blocks = day.raw["blocks"] as? [[String: Any]] else { return false }
             guard let i = blocks.firstIndex(where: { Raw.string($0, "id") == id }) else { return true }
             let cur = Raw.string(blocks[i], "outcome").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1642,12 +1650,18 @@ final class Store: ObservableObject {
 
     @discardableResult
     private func writeBlocks(_ blocks: [[String: Any]], keepUndo: Bool = false) -> Bool {
-        guard editable, let day = todayDay else { return false }
+        guard editable, let day = shownDay else { return false }
         var root = day.raw
         root["blocks"] = blocks
         root["updated_at"] = Store.stamp()
+        let url = day.url
+        let isNew = !fm.fileExists(atPath: url.path)
         do {
-            try write(root, to: day.url)
+            if isNew { try fm.createDirectory(at: dir, withIntermediateDirectories: true) }
+            // 新建的文件没有旧版，不留 prev；已有文件照旧备份。
+            try write(root, to: url, backup: !isNew)
+            // 今天的第一条落盘时，latest.json 跟着指向这份新文件。
+            if isNew, day.key == todayKey { PlanIO.touchLatest(day.key, in: dir) }
             writeError = nil
             if !keepUndo { undoBlocks = nil; undoSelection = nil; undoDayKey = nil }
             reload()
@@ -2757,6 +2771,16 @@ struct DayView: View {
                     .font(Typo.weekday)
                     .foregroundColor(Palette.secondary)
                 Spacer(minLength: 4)
+                if store.isHistorical {
+                    Button(action: { store.backToToday() }) {
+                        Text(L.backToToday)
+                            .font(Typo.summary)
+                            .foregroundColor(Palette.time)
+                            .padding(.vertical, 2)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
                 Button(action: { store.toggleMode() }) {
                     Text(L.week)
                         .font(Typo.summary)
@@ -2775,23 +2799,11 @@ struct DayView: View {
                     .padding(.top, 3)
             }
             if let banner = store.banner {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(banner)
-                        .font(Typo.summary)
-                        .foregroundColor(Palette.time)
-                        .lineLimit(2)
-                    Spacer(minLength: 4)
-                    if store.isHistorical {
-                        Button(action: { store.backToToday() }) {
-                            Text(L.backToToday)
-                                .font(Typo.summary)
-                                .foregroundColor(Palette.time)
-                                .underline()
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.top, 4)
+                Text(banner)
+                    .font(Typo.summary)
+                    .foregroundColor(Palette.time)
+                    .lineLimit(2)
+                    .padding(.top, 4)
             }
         }
         .padding(.horizontal, Layout.hPad)
@@ -2874,10 +2886,10 @@ struct DayView: View {
     private var emptyState: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(DateText.label(store.todayKey))
+                Text(DateText.label(store.shownKey))
                     .font(Typo.date)
                     .foregroundColor(Palette.ink)
-                Text(DateText.weekday(store.todayKey))
+                Text(DateText.weekday(store.shownKey))
                     .font(Typo.weekday)
                     .foregroundColor(Palette.secondary)
                 Spacer(minLength: 4)
@@ -4162,6 +4174,7 @@ enum CLI {
     private static func apply(_ action: Action, key: String, dir: URL) throws {
         var root: [String: Any]
         var url: URL
+        var created = false
         if let loaded = try? PlanIO.read(key, in: dir) {
             root = loaded.root
             url = loaded.url
@@ -4170,6 +4183,7 @@ enum CLI {
             root = PlanIO.newDayRoot(key)
             url = PlanIO.fileURL(key, in: dir)
             try PlanIO.fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            created = true
         } else {
             throw PlanError.missing(key)
         }
@@ -4203,6 +4217,9 @@ enum CLI {
         root["blocks"] = blocks
         root["updated_at"] = Store.stamp()
         try PlanIO.write(root, to: url)
+        if created, key == Store.keyFormatter().string(from: Date()) {
+            PlanIO.touchLatest(key, in: dir)
+        }
     }
 
     private static func index(_ n: Int, in blocks: [[String: Any]], key: String) throws -> Int {
