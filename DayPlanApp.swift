@@ -27,21 +27,60 @@ extension NSColor {
     }
 }
 
+// v11：颜色随外观动态切换。浅色值保持改造前不变；深色值不是反转，而是把纸底
+// 换成偏暖的近黑、文字换成偏暖的白，暖棕提亮成琥珀，否则在深底上会糊成一片。
 enum Palette {
-    static let paperHex: UInt32 = 0xF7F5F0
-    static let paper = Color(hex: paperHex)
-    static let ink = Color(hex: 0x1C1C1C)
-    static let secondary = Color(hex: 0x6B6B6B)
-    static let time = Color(hex: 0x8A6A3A)
-    static let timeDeep = Color(hex: 0x6B4E28)
-    static let done = Color(hex: 0xA8A29A)
-    static let rule = Color(hex: 0x1C1C1C).opacity(0.08)
+    static func isDark(_ appearance: NSAppearance) -> Bool {
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+    }
 
-    static let paperNS = NSColor(hex: paperHex)
-    static let inkNS = NSColor(hex: 0x1C1C1C)
-    static let secondaryNS = NSColor(hex: 0x6B6B6B)
-    static let timeNS = NSColor(hex: 0x8A6A3A)
-    static let doneNS = NSColor(hex: 0xA8A29A)
+    static func dynNS(_ light: UInt32, _ dark: UInt32) -> NSColor {
+        NSColor(name: nil) { appearance in
+            NSColor(hex: isDark(appearance) ? dark : light)
+        }
+    }
+
+    static func dyn(_ light: UInt32, _ dark: UInt32) -> Color {
+        Color(nsColor: dynNS(light, dark))
+    }
+
+    // 半透明的 ink：深底上浅色的低透明度更看不见，暗色要浓一档。
+    static func inkAlpha(_ light: CGFloat, _ dark: CGFloat) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            let darkMode = isDark(appearance)
+            return NSColor(hex: darkMode ? 0xEDE9E2 : 0x1C1C1C)
+                .withAlphaComponent(darkMode ? dark : light)
+        })
+    }
+
+    static let paper = dyn(0xF7F5F0, 0x1B1A18)
+    static let ink = dyn(0x1C1C1C, 0xEDE9E2)
+    static let secondary = dyn(0x6B6B6B, 0x9C968C)
+    static let time = dyn(0x8A6A3A, 0xC9A46B)
+    static let nowDot = dyn(0x5E93C0, 0x7FB3DC)   // 当前时段的圆点：淡蓝，压一层灰，不抢眼
+    static let timeDeep = dyn(0x6B4E28, 0xE4C493) // 统计里「今天」那根柱，比普通柱亮一档
+    static let done = dyn(0xA8A29A, 0x6E6960)
+    static let rule = inkAlpha(0.08, 0.12)
+
+    // 纸色蒙版：暗色下玻璃本身偏暗，蒙版太厚会变成实心，所以减薄。
+    static let paperVeil = Color(nsColor: NSColor(name: nil) { appearance in
+        let darkMode = isDark(appearance)
+        return NSColor(hex: darkMode ? 0x1B1A18 : 0xF7F5F0)
+            .withAlphaComponent(darkMode ? 0.55 : 0.62)
+    })
+
+    // 统计柱：浅色沿用暖棕 60%，深色直接用琥珀，不加透明度。
+    static let bar = Color(nsColor: NSColor(name: nil) { appearance in
+        isDark(appearance)
+            ? NSColor(hex: 0xC9A46B)
+            : NSColor(hex: 0x8A6A3A).withAlphaComponent(0.6)
+    })
+
+    static let paperNS = dynNS(0xF7F5F0, 0x1B1A18)
+    static let inkNS = dynNS(0x1C1C1C, 0xEDE9E2)
+    static let secondaryNS = dynNS(0x6B6B6B, 0x9C968C)
+    static let timeNS = dynNS(0x8A6A3A, 0xC9A46B)
+    static let doneNS = dynNS(0xA8A29A, 0x6E6960)
 }
 
 // MARK: - 文案（简中 / 英文，跟随系统语言）
@@ -171,6 +210,9 @@ struct L10n {
     var settingsTitle: String { isZH ? "设置" : "Settings" }
     var languageLabel: String { isZH ? "语言" : "Language" }
     var followSystem: String { isZH ? "跟随系统" : "System" }
+    var themeLabel: String { isZH ? "外观" : "Appearance" }
+    var themeLight: String { isZH ? "浅色" : "Light" }
+    var themeDark: String { isZH ? "深色" : "Dark" }
     var dataDirLabel: String { isZH ? "数据目录" : "Data folder" }
     var openFolder: String { isZH ? "打开" : "Open" }
     var changeFolder: String { isZH ? "更改…" : "Change…" }
@@ -213,6 +255,14 @@ struct L10n {
         case .en: return "English"
         }
     }
+
+    func themeName(_ t: ThemeSource) -> String {
+        switch t {
+        case .system: return followSystem
+        case .light: return themeLight
+        case .dark: return themeDark
+        }
+    }
 }
 
 // MARK: - 设置（语言 / 数据目录）
@@ -233,18 +283,53 @@ enum LangSource: String, CaseIterable, Identifiable {
     }
 }
 
+// v11：外观三态。system 不覆盖 SwiftUI 的色彩环境与窗口 appearance，交给系统；
+// light / dark 强制。存 UserDefaults 的 theme。
+enum ThemeSource: String, CaseIterable, Identifiable {
+    case system, light, dark
+    var id: String { rawValue }
+
+    static func stored() -> ThemeSource {
+        let defaults = UserDefaults.standard
+        var raw = defaults.string(forKey: "theme")
+        if raw == nil {
+            let id = Bundle.main.bundleIdentifier ?? "io.github.peberwang.dayplan"
+            raw = UserDefaults(suiteName: id)?.string(forKey: "theme")
+        }
+        return ThemeSource(rawValue: raw ?? "") ?? .system
+    }
+
+    var colorScheme: ColorScheme? {
+        switch self {
+        case .system: return nil
+        case .light: return .light
+        case .dark: return .dark
+        }
+    }
+
+    var nsAppearance: NSAppearance? {
+        switch self {
+        case .system: return nil
+        case .light: return NSAppearance(named: .aqua)
+        case .dark: return NSAppearance(named: .darkAqua)
+        }
+    }
+}
+
 // 语言与数据目录的唯一来源。视图用 @ObservedObject 观察它，切换语言时 SwiftUI
 // 会重算 body，所以不需要重建 NSHostingView。
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
     @Published private(set) var language: LangSource
+    @Published private(set) var theme: ThemeSource          // v11：外观三态
     @Published private(set) var dataDirText: String     // 当前生效的目录
     @Published private(set) var envDirActive: Bool      // DAYPLAN_DIR 是否在生效
     @Published private(set) var autoUpdate: Bool        // v9：自动检查并更新，默认开
 
     private init() {
         language = LangSource.stored()
+        theme = ThemeSource.stored()
         let env = ProcessInfo.processInfo.environment
         envDirActive = !(env["DAYPLAN_DIR"] ?? "").isEmpty
         dataDirText = PlanIO.resolveDir().path
@@ -258,6 +343,12 @@ final class SettingsStore: ObservableObject {
         guard s != language else { return }
         language = s
         UserDefaults.standard.set(s.rawValue, forKey: "language")
+    }
+
+    func setTheme(_ t: ThemeSource) {
+        guard t != theme else { return }
+        theme = t
+        UserDefaults.standard.set(t.rawValue, forKey: "theme")
     }
 
     // 环境变量优先；它存在时也照样记下选择，等环境变量撤掉就生效。
@@ -297,7 +388,7 @@ var L: L10n { SettingsStore.shared.l10n }
 
 enum AppVersion {
     // 构建时写入：Info.plist 缺 CFBundleShortVersionString 时用它。发布时与 VERSION 一起改。
-    static let fallback = "0.9.0"
+    static let fallback = "0.11.0"
 
     static var current: String {
         if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
@@ -696,6 +787,9 @@ enum Typo {
                : .system(size: 11.5)
     }
     static var time: Font { .system(size: 12.5, design: .monospaced).monospacedDigit() }
+    static var timeNow: Font {
+        .system(size: 12.5, weight: .medium, design: .monospaced).monospacedDigit()
+    }
     static var units: Font { .system(size: 11, design: .monospaced).monospacedDigit() }
     static var summary: Font {
         L.isZH ? Font.custom("PingFangSC-Regular", fixedSize: 11) : .system(size: 11)
@@ -995,12 +1089,15 @@ final class Store: ObservableObject {
     @Published var hoveredID: String?           // 鼠标停在哪条上（只用来浮现写记录的小图标）
     @Published var expandedOutcome: String?     // 哪一条的记录区正展开
     @Published var outcomeEditorHeight: CGFloat = Layout.outcomeMinHeight
+    @Published private(set) var nowStates: [String: TimeState] = [:]   // 只在今天页有意义
 
     let dir: URL
     weak var stats: StatsStore?
     private let fm = FileManager.default
     private var signature = ""
     private var timer: Timer?
+    private var nowTimer: Timer?
+    private var statsVisible = false
     private var undoBlocks: [[String: Any]]?
     private var undoSelection: String?
     private var undoDayKey: String?
@@ -1020,11 +1117,13 @@ final class Store: ObservableObject {
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        refreshNowClock()
     }
 
     func stopWatching() {
         timer?.invalidate()
         timer = nil
+        stopNowClock()
     }
 
     // MARK: 日期
@@ -1166,6 +1265,7 @@ final class Store: ObservableObject {
             errorText = L.noPlan
         }
         signature = currentSignature()
+        refreshNowClock()
     }
 
     private func loadFallback(excluding key: String) -> DayData? {
@@ -1173,6 +1273,66 @@ final class Store: ObservableObject {
         let lk = l.deletingPathExtension().lastPathComponent
         guard lk != key else { return nil }
         return loadDay(lk, weekday: DateText.weekday(lk), isToday: false, migrate: false).day
+    }
+
+    // MARK: 当前时段
+
+    // 统计窗口盖在前面时也算「不在今天页」，停表省电；关掉后立刻重算。
+    func setStatsVisible(_ on: Bool) {
+        guard statsVisible != on else { return }
+        statsVisible = on
+        refreshNowClock()
+    }
+
+    // 回到前台时调用：先确认该不该跑，再立刻算一遍，不等下一分钟。
+    func refreshNow() {
+        refreshNowClock()
+        recalcNow()
+    }
+
+    private func refreshNowClock() {
+        let should = mode == .day && editable && !statsVisible
+        if should {
+            if nowTimer == nil { startNowClock() }
+            recalcNow()
+        } else {
+            stopNowClock()
+        }
+    }
+
+    private func startNowClock() {
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            self?.recalcNow()
+        }
+        t.tolerance = 2
+        RunLoop.main.add(t, forMode: .common)
+        nowTimer = t
+        nowLog("clock start")
+    }
+
+    private func stopNowClock() {
+        let wasRunning = nowTimer != nil
+        nowTimer?.invalidate()
+        nowTimer = nil
+        if !nowStates.isEmpty { nowStates = [:] }
+        if wasRunning { nowLog("clock stop") }
+    }
+
+    // 每分钟、文件重载、回到前台都会走这里；状态没变就不发布，少刷界面。
+    private func recalcNow() {
+        guard nowTimer != nil, mode == .day, editable, let day = todayDay else {
+            if !nowStates.isEmpty { nowStates = [:] }
+            return
+        }
+        let next = TimeStatus.states(day.blocks.map { (id: $0.id, time: $0.time) }, at: Date())
+        nowLog("recalc \(day.blocks.count) entries, now=\(next.values.filter { $0 == .now }.count)")
+        if next != nowStates { nowStates = next }
+    }
+
+    private func nowLog(_ message: String) {
+        guard ProcessInfo.processInfo.environment["DAYPLAN_NOW_DEBUG"] == "1" else { return }
+        let stamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+        FileHandle.standardError.write(Data("[now] \(stamp) \(message)\n".utf8))
     }
 
     // MARK: 展示状态
@@ -1206,6 +1366,7 @@ final class Store: ObservableObject {
         finishEditing()
         selectedID = nil
         mode = (mode == .day) ? .week : .day
+        refreshNowClock()
     }
 
     func show(_ m: Mode) {
@@ -1213,6 +1374,7 @@ final class Store: ObservableObject {
         selectedID = nil
         if m == .day { viewingKey = nil }
         mode = m
+        refreshNowClock()
     }
 
     func openDay(_ key: String) {
@@ -1221,6 +1383,7 @@ final class Store: ObservableObject {
         selectedID = nil
         viewingKey = (key == todayKey) ? nil : key
         mode = .day
+        refreshNowClock()
     }
 
     func backToToday() {
@@ -1228,6 +1391,7 @@ final class Store: ObservableObject {
         selectedID = nil
         viewingKey = nil
         mode = .day
+        refreshNowClock()
     }
 
     // MARK: 编辑
@@ -1722,6 +1886,119 @@ enum Fmt {
     }
 }
 
+// MARK: - 当前时段（v10）
+
+// time 的解析与状态计算都在这里，纯函数，方便单独测。
+// 支持 "14:30 – 17:30"、"09:00 - 10:30"、"14:30"、空串；解析失败一律 .none，不报错。
+// 只有开始时间时，结束取「下一条有时间的开始」与 23:59 的较小值；跨午夜不支持。
+
+enum TimeState: String, Equatable {
+    case now
+    case past
+    case next
+    case none
+}
+
+struct TimeSlot {
+    let start: Int   // 当天 0 点起的秒数
+    let end: Int
+
+    func contains(_ seconds: Int) -> Bool { seconds >= start && seconds < end }
+}
+
+enum TimeStatus {
+    private static let endOfDay = 23 * 3600 + 59 * 60
+    private static let pattern = try! NSRegularExpression(pattern: #"(\d{1,2}):(\d{2})"#)
+
+    // 取前两个 HH:mm；格式与取值都要合法。
+    private static func times(_ raw: String) -> [(hour: Int, minute: Int)]? {
+        let ns = raw as NSString
+        let found = pattern.matches(in: raw, range: NSRange(location: 0, length: ns.length))
+        guard !found.isEmpty else { return nil }
+        var out: [(hour: Int, minute: Int)] = []
+        for m in found.prefix(2) {
+            guard m.numberOfRanges == 3,
+                  let h = Int(ns.substring(with: m.range(at: 1))),
+                  let mm = Int(ns.substring(with: m.range(at: 2))),
+                  (0...23).contains(h), (0...59).contains(mm) else { return nil }
+            out.append((h, mm))
+        }
+        return out
+    }
+
+    private static func seconds(_ t: (hour: Int, minute: Int)) -> Int {
+        t.hour * 3600 + t.minute * 60
+    }
+
+    private static func clock(_ date: Date, _ calendar: Calendar) -> Int {
+        let c = calendar.dateComponents([.hour, .minute, .second], from: date)
+        return (c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0)
+    }
+
+    // 第一个时间是开始；第二个是结束。只有开始时用 nextStart 兜底。
+    static func slot(_ raw: String, nextStart: String? = nil) -> TimeSlot? {
+        guard let parsed = times(raw), let first = parsed.first else { return nil }
+        let start = seconds(first)
+        if parsed.count >= 2 {
+            let end = seconds(parsed[1])
+            guard end > start else { return nil }   // 结束早于/等于开始：无时间
+            return TimeSlot(start: start, end: end)
+        }
+        var end = endOfDay
+        if let nextStart, let next = times(nextStart)?.first {
+            end = min(seconds(next), endOfDay)
+        }
+        guard end > start else { return nil }
+        return TimeSlot(start: start, end: end)
+    }
+
+    static func state(_ raw: String, at now: Date, nextStart: String? = nil,
+                      calendar: Calendar = .current) -> TimeState {
+        guard let slot = slot(raw, nextStart: nextStart) else { return .none }
+        let t = clock(now, calendar)
+        if t < slot.start { return .next }
+        if t >= slot.end { return .past }
+        return .now
+    }
+
+    // 一次算一整天的条目。同一时刻最多一个 now：重叠时开始更早的赢，另一条按 next。
+    static func states(_ entries: [(id: String, time: String)], at now: Date,
+                       calendar: Calendar = .current) -> [String: TimeState] {
+        var found: [(id: String, slot: TimeSlot, index: Int)] = []
+        for (i, e) in entries.enumerated() {
+            // 只有开始时间时，往后找最近一条能解析出开始的条目。
+            var nextStart: String?
+            if i + 1 < entries.count {
+                nextStart = entries[(i + 1)...].lazy.compactMap { item -> String? in
+                    guard let t = times(item.time)?.first else { return nil }
+                    return String(format: "%02d:%02d", t.hour, t.minute)
+                }.first
+            }
+            if let slot = slot(e.time, nextStart: nextStart) {
+                found.append((e.id, slot, i))
+            }
+        }
+
+        let t = clock(now, calendar)
+        var out: [String: TimeState] = [:]
+        for e in entries { out[e.id] = TimeState.none }
+        for e in found {
+            if t < e.slot.start { out[e.id] = .next }
+            else if t >= e.slot.end { out[e.id] = .past }
+            else { out[e.id] = .now }
+        }
+
+        let active = found.filter { $0.slot.contains(t) }
+        if let winner = active.min(by: { a, b in
+            a.slot.start == b.slot.start ? a.index < b.index : a.slot.start < b.slot.start
+        }) {
+            out[winner.id] = .now
+            for e in active where e.id != winner.id { out[e.id] = .next }
+        }
+        return out
+    }
+}
+
 // MARK: - 视图
 
 struct CheckMark: View {
@@ -1745,11 +2022,13 @@ struct CheckMark: View {
 
 struct OriginDot: View {
     let user: Bool
+    var state: TimeState = .none
 
     var body: some View {
         Circle()
-            .fill(user ? Palette.time.opacity(0.85) : Palette.ink.opacity(0.13))
-            .frame(width: 4, height: 4)
+            .fill(state == .now ? Palette.nowDot : (user ? Palette.time.opacity(0.85) : Palette.inkAlpha(0.13, 0.20)))
+            .frame(width: state == .now ? 6 : 4, height: state == .now ? 6 : 4)
+
     }
 }
 
@@ -1780,7 +2059,7 @@ final class InlineField: NSTextField, NSTextFieldDelegate {
         f.textColor = color
         f.placeholderAttributedString = NSAttributedString(
             string: placeholder,
-            attributes: [.foregroundColor: NSColor(hex: 0xA8A29A), .font: font])
+            attributes: [.foregroundColor: Palette.doneNS, .font: font])
         f.isBordered = false
         f.isBezeled = false
         f.drawsBackground = false
@@ -2121,6 +2400,7 @@ struct BlockRow: View {
     private var L: L10n { settings.l10n }
     let block: Block
     let editable: Bool
+    let nowState: TimeState
 
     private var field: Store.Field? {
         guard let e = store.editing, e.blockID == block.id else { return nil }
@@ -2149,8 +2429,9 @@ struct BlockRow: View {
         .padding(.horizontal, 8)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(store.selectedID == block.id ? Palette.ink.opacity(0.045) : Color.clear)
+                .fill(store.selectedID == block.id ? Palette.inkAlpha(0.045, 0.08) : Color.clear)
         )
+
         .onHover { store.setHover(block.id, $0) }
         .contextMenu { menu }
     }
@@ -2209,7 +2490,7 @@ struct BlockRow: View {
         VStack(alignment: .leading, spacing: 0) {
             // 任务与实况之间一条极淡分隔线（2026-11-24 15:14）
             Rectangle()
-                .fill(Palette.rule.opacity(0.5))
+                .fill(Palette.inkAlpha(0.04, 0.06))
                 .frame(height: 1)
                 .padding(.leading, Layout.timeColumn + Layout.timeGap)
                 .padding(.trailing, Layout.hPad)
@@ -2286,7 +2567,7 @@ struct BlockRow: View {
     private var timeColumn: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                OriginDot(user: block.isUser)
+                OriginDot(user: block.isUser, state: nowState)
                     .offset(y: -3)
                 timeView
             }
@@ -2304,6 +2585,7 @@ struct BlockRow: View {
             Text(block.time.isEmpty ? "—" : Fmt.time(block.time))
                 .font(Typo.time)
                 .foregroundColor(block.done ? Palette.done : Palette.time)
+
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
                 .frame(height: 16, alignment: .leading)
@@ -2364,11 +2646,15 @@ struct BlockRow: View {
     }
 
     private var check: some View {
+        // 不给 Button 加 .disabled：禁用态在 SwiftUI 里会让整块区域不接收点击，
+        // 而 editable 的判定曾经误伤过。改成 action 内守卫 + 放大命中区。
         Button(action: { if editable { store.toggle(block.id) } }) {
             CheckMark(done: block.done, dim: !editable)
+                .frame(width: 26, height: 26)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!editable)
+        .zIndex(2)
     }
 
     @ViewBuilder
@@ -2456,7 +2742,7 @@ struct DayView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(Palette.paper)
+        // 背景交给 RootView 的玻璃与半透明纸色，这里不能再铺一层实心色
     }
 
     private func header(_ day: DayData) -> some View {
@@ -2518,7 +2804,8 @@ struct DayView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(alignment: .leading, spacing: 0) {
                     ForEach(day.blocks) { b in
-                        BlockRow(store: store, block: b, editable: store.editable)
+                        BlockRow(store: store, block: b, editable: store.editable,
+                                 nowState: store.nowStates[b.id] ?? TimeState.none)
                             .id(b.id)
                     }
                     if store.editable {
@@ -2628,7 +2915,7 @@ struct ProgressLine: View {
     var body: some View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
-                Capsule().fill(Palette.ink.opacity(0.06))
+                Capsule().fill(Palette.inkAlpha(0.06, 0.10))
                 Capsule().fill(Palette.time.opacity(0.7))
                     .frame(width: max(0, min(1, rate)) * g.size.width)
             }
@@ -2672,7 +2959,7 @@ struct WeekRow: View {
         .padding(.horizontal, 6)
         .background(
             RoundedRectangle(cornerRadius: 5)
-                .fill(highlight ? Palette.ink.opacity(0.045) : Color.clear)
+                .fill(highlight ? Palette.inkAlpha(0.045, 0.08) : Color.clear)
         )
         .contentShape(Rectangle())
         .onTapGesture { store.openDay(day.key) }
@@ -2747,13 +3034,46 @@ struct WeekView: View {
 
 // MARK: 根视图
 
+/// 桌面透出来的毛玻璃底。放在纸色下面，纸色半透明，于是卡片像一片浮在桌面上的玻璃。
+struct BlurBackdrop: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .hudWindow
+        v.blendingMode = .behindWindow
+        v.state = .active
+        v.isEmphasized = false
+        return v
+    }
+    func updateNSView(_ v: NSVisualEffectView, context: Context) {}
+}
+
+// v11：外观由设置决定。system 时不写 colorScheme，跟随系统与窗口 appearance；
+// light / dark 强制整棵视图树的 SwiftUI 色彩环境与动态色解析。
+struct ThemedScheme: ViewModifier {
+    @ObservedObject var settings = SettingsStore.shared
+
+    func body(content: Content) -> some View {
+        Group {
+            if let scheme = settings.theme.colorScheme {
+                content.environment(\.colorScheme, scheme)
+            } else {
+                content
+            }
+        }
+    }
+}
+
+extension View {
+    func themedScheme() -> some View { modifier(ThemedScheme()) }
+}
+
 struct RootView: View {
     @ObservedObject var store: Store
     @ObservedObject var settings = SettingsStore.shared
 
     var body: some View {
         ZStack(alignment: .topLeading) {
-            Palette.paper
+            Palette.paperVeil
             if store.mode == .week {
                 WeekView(store: store)
             } else {
@@ -2762,11 +3082,9 @@ struct RootView: View {
         }
         .frame(width: Layout.width, height: Layout.height)
         .clipShape(RoundedRectangle(cornerRadius: Layout.corner, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: Layout.corner, style: .continuous)
-                .stroke(Palette.ink.opacity(0.06), lineWidth: 1)
-        )
-        .environment(\.colorScheme, .light)
+        // 顶部一道极细的高光，底部略暗，做出玻璃的厚度感
+        // 边缘完全交给系统的玻璃与窗口阴影，这里不再画任何描边或内发光
+        .themedScheme()
     }
 }
 
@@ -2784,9 +3102,9 @@ struct StatsRootView: View {
             .clipShape(RoundedRectangle(cornerRadius: Layout.corner, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: Layout.corner, style: .continuous)
-                    .stroke(Palette.ink.opacity(0.06), lineWidth: 1)
+                    .stroke(Palette.inkAlpha(0.06, 0.10), lineWidth: 1)
             )
-            .environment(\.colorScheme, .light)
+            .themedScheme()
     }
 }
 
@@ -2872,14 +3190,14 @@ struct StatsView: View {
         return ZStack(alignment: .topLeading) {
             // 100% 极淡实线，50% 虚线；不标数字。
             Rectangle()
-                .fill(Palette.ink.opacity(0.045))
+                .fill(Palette.inkAlpha(0.045, 0.10))
                 .frame(width: barsW, height: 1)
                 .offset(x: startX, y: 0)
             Path { p in
                 p.move(to: CGPoint(x: 0, y: plotH * 0.5))
                 p.addLine(to: CGPoint(x: barsW, y: plotH * 0.5))
             }
-            .stroke(Palette.ink.opacity(0.10), style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
+            .stroke(Palette.inkAlpha(0.10, 0.18), style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
             .offset(x: startX)
 
             ForEach(Array(series.enumerated()), id: \.element.id) { i, d in
@@ -2888,7 +3206,7 @@ struct StatsView: View {
                 if d.hasData {
                     let h = max(2, CGFloat(d.rate) * plotH)
                     RoundedRectangle(cornerRadius: 2, style: .continuous)
-                        .fill(d.isToday ? Palette.timeDeep : Palette.time.opacity(0.6))
+                        .fill(d.isToday ? Palette.timeDeep : Palette.bar)
                         .frame(width: barW, height: h)
                         .offset(x: x, y: plotH - h)
                 }
@@ -3017,6 +3335,22 @@ struct SettingsView: View {
             .labelsHidden()
             .frame(width: 300, alignment: .leading)
 
+            // v11：外观三态，切换立即生效
+            Text(L.themeLabel)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(Palette.ink)
+                .padding(.top, 20)
+                .padding(.bottom, 7)
+            Picker("", selection: Binding(get: { settings.theme },
+                                          set: { settings.setTheme($0) })) {
+                ForEach(ThemeSource.allCases) { t in
+                    Text(L.themeName(t)).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 300, alignment: .leading)
+
             Text(L.dataDirLabel)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(Palette.ink)
@@ -3096,9 +3430,9 @@ struct SettingsView: View {
         .padding(.horizontal, 22)
         .padding(.top, 20)
         .padding(.bottom, 16)
-        .frame(width: 460, height: 400, alignment: .topLeading)
+        .frame(width: 460, height: 470, alignment: .topLeading)
         .background(Palette.paper)
-        .environment(\.colorScheme, .light)
+        .themedScheme()
     }
 
     // 更新状态一行：检查中 > 已更新待重启 > 最近一次手动检查结果 > 说明
@@ -3150,9 +3484,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     private var stats: StatsStore!
     private var window: CardWindow!
     private var host: FirstMouseHostingView!
+    private var glassView: NSGlassEffectView?
     private var statsWindow: CardWindow?
     private var statsHost: NSHostingView<StatsRootView>?
     private var settingsWindow: NSWindow?
+    private var themeCancellable: AnyCancellable?
     private var statusItem: NSStatusItem?
     private var statusToggleItem: NSMenuItem?
     private var statusStatsItem: NSMenuItem?
@@ -3175,6 +3511,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
         buildMenu()
 
+        // v11：设置里切外观时，AppKit 的窗口 / 玻璃容器要同步改 appearance。
+        themeCancellable = settings.$theme.sink { [weak self] theme in self?.applyTheme(theme) }
+
         let env = ProcessInfo.processInfo.environment
         let plansDir = PlanIO.resolveDir()
         let statsDir = env["DAYPLAN_STATS_DIR"].map { URL(fileURLWithPath: $0) }
@@ -3186,8 +3525,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stats.backfill(from: plansDir)
 
         buildWindow()
+        applyTheme(settings.theme)
         buildStatusItem()
         store.startWatching()
+
+        // 应用在后台照样每分钟算；回到前台立刻补算一次。
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
+                                               object: nil, queue: .main) { [weak self] _ in
+            self?.store.refreshNow()
+        }
 
         NotificationCenter.default.addObserver(forName: .dayplanUpdateStateChanged,
                                                object: nil, queue: .main) { [weak self] _ in
@@ -3239,12 +3585,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.isMovable = false
         w.isMovableByWindowBackground = false
         w.isReleasedWhenClosed = false
-        w.appearance = NSAppearance(named: .aqua)
+        w.appearance = settings.theme.nsAppearance
         w.delegate = self
 
         host = FirstMouseHostingView(rootView: RootView(store: store))
-        w.contentView = host
+        // 原生 Liquid Glass：玻璃作为容器，内容放进它的 contentView，折射与高光由系统给。
+        let glass = NSGlassEffectView()
+        glass.style = .regular
+        glass.cornerRadius = Layout.corner
+        glass.appearance = settings.theme.nsAppearance
+        glass.contentView = host
+        w.contentView = glass
+        glassView = glass
         window = w
+    }
+
+    // 外观切换后：窗口与玻璃的 appearance 跟着走；system 传 nil，交还系统。
+    // SwiftUI 那层由各根视图的 themedScheme() 观察 SettingsStore 自己刷新。
+    // @Published 在属性真正赋值之前就发出新值，所以这里用回调参数而不是 settings.theme，
+    // 否则切主题时 AppKit 那层永远慢一拍（玻璃停在旧外观，界面只换了文字色）。
+    private func applyTheme(_ theme: ThemeSource) {
+        let appearance = theme.nsAppearance
+        window?.appearance = appearance
+        glassView?.appearance = appearance
+        statsWindow?.appearance = appearance
+        settingsWindow?.appearance = appearance
+        settingsWindow?.backgroundColor = Palette.paperNS
     }
 
     private func placeWindow() {
@@ -3287,6 +3653,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         ActiveEditor.commitNow()
         ActiveOutcome.commitNow()
+        if sender === statsWindow { store.setStatsVisible(false) }
         sender.orderOut(nil)
         return false
     }
@@ -3312,6 +3679,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         stats.reload()
         if statsWindow == nil { buildStatsWindow() }
         guard let w = statsWindow else { return }
+        store.setStatsVisible(true)
         if !w.isVisible { w.center() }
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -3328,11 +3696,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.hasShadow = true
         w.isMovableByWindowBackground = true
         w.isReleasedWhenClosed = false
-        w.appearance = NSAppearance(named: .aqua)
+        w.appearance = settings.theme.nsAppearance
         w.delegate = self
 
         let root = StatsRootView(stats: stats, onClose: { [weak self] in
-            self?.statsWindow?.orderOut(nil)
+            self?.closeStats()
         })
         let h = NSHostingView(rootView: root)
         w.contentView = h
@@ -3342,6 +3710,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func closeStats() {
         statsWindow?.orderOut(nil)
+        store.setStatsVisible(false)
     }
 
     // MARK: 设置窗口
@@ -3355,7 +3724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 400),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 470),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = L.settingsTitle
@@ -3364,9 +3733,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.isReleasedWhenClosed = false
         w.backgroundColor = Palette.paperNS
         w.isMovableByWindowBackground = true
-        w.appearance = NSAppearance(named: .aqua)
-        w.contentMinSize = NSSize(width: 460, height: 400)
-        w.contentMaxSize = NSSize(width: 460, height: 400)
+        w.appearance = settings.theme.nsAppearance
+        w.contentMinSize = NSSize(width: 460, height: 470)
+        w.contentMaxSize = NSSize(width: 460, height: 470)
 
         let root = SettingsView(settings: settings,
                                 onLanguageChange: { [weak self] in self?.refreshLocalizedTitles() },
@@ -3473,7 +3842,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     private func closeKeyWindow() {
         if let s = statsWindow, s.isKeyWindow {
-            s.orderOut(nil)
+            closeStats()
         } else if window.isKeyWindow {
             hideWindow()
         }
@@ -3930,6 +4299,7 @@ enum CLI {
 
 // MARK: - 入口
 
+#if !DAYPLAN_TEST
 @main
 enum DayPlanMain {
     @MainActor
@@ -3945,3 +4315,4 @@ enum DayPlanMain {
         withExtendedLifetime(delegate) { app.run() }
     }
 }
+#endif
