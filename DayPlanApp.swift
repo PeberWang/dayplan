@@ -217,6 +217,14 @@ struct L10n {
     var chooseFolder: String { isZH ? "选择" : "Choose" }
     var aboutLabel: String { isZH ? "关于" : "About" }
 
+    // 启动（v13）
+    var startupLabel: String { isZH ? "启动" : "Startup" }
+    var launchAtLoginLabel: String { isZH ? "登录时自动启动" : "Open at login" }
+    var launchAtLoginHint: String {
+        isZH ? "关掉后不再随登录启动，下次登录想用请自己打开" 
+             : "Turn off to stop opening at login."
+    }
+
     // 更新
     var updateLabel: String { isZH ? "更新" : "Updates" }
     var autoUpdateLabel: String { isZH ? "自动检查并更新" : "Check and update automatically" }
@@ -312,6 +320,100 @@ enum ThemeSource: String, CaseIterable, Identifiable {
 
 // 语言与数据目录的唯一来源。视图用 @ObservedObject 观察它，切换语言时 SwiftUI
 // 会重算 body，所以不需要重建 NSHostingView。
+// MARK: - 登录时自动启动（v13）
+
+// 用 LaunchAgent 而不是 SMAppService。本应用是本地 ad-hoc 签名的构建，
+// SMAppService 对未签名 / 不在 /Applications 的 app 经常 register 失败；
+// LaunchAgent 只依赖一份 plist，登录时由 launchd 拉起，装在哪里都稳定。
+// 默认开启；设置里显式关掉才会移除 plist。
+enum LoginItem {
+    static let label = "io.github.peberwang.dayplan"
+
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isInstalled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    // 只有从 .app 里跑才有可靠的路径；裸二进制（CLI、测试）不动系统状态。
+    static var appURL: URL? {
+        let u = Bundle.main.bundleURL
+        return u.pathExtension.lowercased() == "app" ? u : nil
+    }
+
+    private static var domain: String { "gui/\(getuid())" }
+
+    // 返回错误描述；成功返回 nil。
+    @discardableResult
+    static func apply(_ on: Bool) -> String? {
+        on ? install() : uninstall()
+    }
+
+    @discardableResult
+    static func install() -> String? {
+        guard let app = appURL else { return nil }
+        let dir = plistURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let body = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+            <key>Label</key>
+            <string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array>
+                <string>/usr/bin/open</string>
+                <string>-a</string>
+                <string>\(app.path)</string>
+            </array>
+            <key>RunAtLoad</key>
+            <true/>
+            <key>LimitLoadToSessionType</key>
+            <string>Aqua</string>
+        </dict>
+        </plist>
+
+        """
+        do {
+            try body.write(to: plistURL, atomically: true, encoding: .utf8)
+        } catch {
+            return error.localizedDescription
+        }
+        // 先卸再装，保证 launchd 里是最新内容；没装过时 bootout 失败，忽略。
+        launchctl(["bootout", "\(domain)/\(label)"])
+        launchctl(["bootstrap", domain, plistURL.path])
+        return nil
+    }
+
+    @discardableResult
+    static func uninstall() -> String? {
+        launchctl(["bootout", "\(domain)/\(label)"])
+        guard isInstalled else { return nil }
+        do {
+            try FileManager.default.removeItem(at: plistURL)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
+    @discardableResult
+    private static func launchctl(_ args: [String]) -> Int32 {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return -1 }
+        p.waitUntilExit()
+        return p.terminationStatus
+    }
+}
+
 final class SettingsStore: ObservableObject {
     static let shared = SettingsStore()
 
@@ -320,6 +422,7 @@ final class SettingsStore: ObservableObject {
     @Published private(set) var dataDirText: String     // 当前生效的目录
     @Published private(set) var envDirActive: Bool      // DAYPLAN_DIR 是否在生效
     @Published private(set) var autoUpdate: Bool        // v9：自动检查并更新，默认开
+    @Published private(set) var launchAtLogin: Bool     // v13：登录时自动启动，默认开
 
     private init() {
         language = LangSource.stored()
@@ -329,6 +432,7 @@ final class SettingsStore: ObservableObject {
         dataDirText = PlanIO.resolveDir().path
         // 没写过就是开。显式写 false 才算关。
         autoUpdate = SettingsStore.storedBool("autoUpdate", default: true)
+        launchAtLogin = SettingsStore.storedBool("launchAtLogin", default: true)
     }
 
     var l10n: L10n { L10n.from(language) }
@@ -365,6 +469,20 @@ final class SettingsStore: ObservableObject {
         UpdateStore.setPref("autoUpdate", on)
     }
 
+    func setLaunchAtLogin(_ on: Bool) {
+        guard on != launchAtLogin else { return }
+        launchAtLogin = on
+        UserDefaults.standard.set(on, forKey: "launchAtLogin")
+        let id = Bundle.main.bundleIdentifier ?? "io.github.peberwang.dayplan"
+        UserDefaults(suiteName: id)?.set(on, forKey: "launchAtLogin")
+        LoginItem.apply(on)
+    }
+
+    // 每次启动对齐一次：默认开的那份 plist 丢了会自动补回来；用户显式关了就不再写。
+    func syncLaunchAtLogin() {
+        LoginItem.apply(launchAtLogin)
+    }
+
     // 直接跑二进制（不在 .app 里）时 standard 可能读不到应用自己的 domain，再按 bundle id 读一次。
     static func storedBool(_ key: String, default def: Bool) -> Bool {
         if let v = UserDefaults.standard.object(forKey: key) as? Bool { return v }
@@ -382,7 +500,7 @@ var L: L10n { SettingsStore.shared.l10n }
 
 enum AppVersion {
     // 构建时写入：Info.plist 缺 CFBundleShortVersionString 时用它。发布时与 VERSION 一起改。
-    static let fallback = "0.12.0"
+    static let fallback = "0.13.0"
 
     static var current: String {
         if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
@@ -3363,6 +3481,25 @@ struct SettingsView: View {
             .labelsHidden()
             .frame(width: 300, alignment: .leading)
 
+            // v13：登录时自动启动，默认开
+            Text(L.startupLabel)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundColor(Palette.ink)
+                .padding(.top, 20)
+                .padding(.bottom, 7)
+            Toggle(isOn: Binding(get: { settings.launchAtLogin },
+                                 set: { settings.setLaunchAtLogin($0) })) {
+                Text(L.launchAtLoginLabel)
+                    .font(.system(size: 12))
+                    .foregroundColor(Palette.ink)
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            Text(L.launchAtLoginHint)
+                .font(.system(size: 11))
+                .foregroundColor(Palette.secondary)
+                .padding(.top, 4)
+
             Text(L.dataDirLabel)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundColor(Palette.ink)
@@ -3442,7 +3579,7 @@ struct SettingsView: View {
         .padding(.horizontal, 22)
         .padding(.top, 20)
         .padding(.bottom, 16)
-        .frame(width: 460, height: 470, alignment: .topLeading)
+        .frame(width: 460, height: 560, alignment: .topLeading)
         .background(Palette.paper)
         .themedScheme()
     }
@@ -3520,6 +3657,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             NSApp.terminate(nil)
             return
         }
+
+        // v13：默认随登录启动；用户关过就不再装，plist 被删掉会自动补回。
+        settings.syncLaunchAtLogin()
 
         buildMenu()
 
@@ -3736,7 +3876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     private func buildSettingsWindow() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 470),
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 560),
                          styleMask: [.titled, .closable],
                          backing: .buffered, defer: false)
         w.title = L.settingsTitle
@@ -3746,8 +3886,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         w.backgroundColor = Palette.paperNS
         w.isMovableByWindowBackground = true
         w.appearance = settings.theme.nsAppearance
-        w.contentMinSize = NSSize(width: 460, height: 470)
-        w.contentMaxSize = NSSize(width: 460, height: 470)
+        w.contentMinSize = NSSize(width: 460, height: 560)
+        w.contentMaxSize = NSSize(width: 460, height: 560)
 
         let root = SettingsView(settings: settings,
                                 onLanguageChange: { [weak self] in self?.refreshLocalizedTitles() },
