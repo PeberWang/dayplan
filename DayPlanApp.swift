@@ -58,6 +58,9 @@ enum Palette {
     static let secondary = dyn(0x6B6B6B, 0x9C968C)
     static let time = dyn(0x8A6A3A, 0xC9A46B)
     static let nowDot = dyn(0x5E93C0, 0x7FB3DC)   // 当前时段的圆点：淡蓝，压一层灰，不抢眼
+    // 设置里的开关：打开时轨道是明确的蓝，关上是中性灰；浅色深色各一档。
+    static let switchOn = dyn(0x2F6FD0, 0x4C8FE8)
+    static let switchOff = dyn(0xD8D4CC, 0x4A4741)
     static let timeDeep = dyn(0x6B4E28, 0xE4C493) // 统计里「今天」那根柱，比普通柱亮一档
     static let done = dyn(0xA8A29A, 0x6E6960)
     static let rule = inkAlpha(0.08, 0.12)
@@ -500,7 +503,7 @@ var L: L10n { SettingsStore.shared.l10n }
 
 enum AppVersion {
     // 构建时写入：Info.plist 缺 CFBundleShortVersionString 时用它。发布时与 VERSION 一起改。
-    static let fallback = "0.13.0"
+    static let fallback = "0.13.1"
 
     static var current: String {
         if let s = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String {
@@ -3428,6 +3431,29 @@ struct StatsView: View {
 
 // 460 × 300 的普通窗口，纸底、自定义标题（不用系统设置窗口的样式）。
 // 语言即时生效：settings 是 @ObservedObject，改 language 会推动所有视图重算 body。
+// 系统 .switch 的「开」色跟系统强调色走，用户把强调色设成灰时开关看不出开没开；
+// .tint 在切换外观后还会掉回系统色。这里自己画：开蓝关灰，两种外观都明确。
+struct DayPlanSwitchStyle: ToggleStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 10) {
+            configuration.label
+            ZStack(alignment: configuration.isOn ? .trailing : .leading) {
+                Capsule()
+                    .fill(configuration.isOn ? Palette.switchOn : Palette.switchOff)
+                    .frame(width: 36, height: 21)
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: .black.opacity(0.18), radius: 1, x: 0, y: 0.5)
+                    .frame(width: 17, height: 17)
+                    .padding(2)
+            }
+            .animation(.easeOut(duration: 0.16), value: configuration.isOn)
+            .contentShape(Capsule())
+            .onTapGesture { configuration.isOn.toggle() }
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var settings: SettingsStore
     let onLanguageChange: () -> Void
@@ -3493,8 +3519,7 @@ struct SettingsView: View {
                     .font(.system(size: 12))
                     .foregroundColor(Palette.ink)
             }
-            .toggleStyle(.switch)
-            .controlSize(.small)
+            .toggleStyle(DayPlanSwitchStyle())
             Text(L.launchAtLoginHint)
                 .font(.system(size: 11))
                 .foregroundColor(Palette.secondary)
@@ -3536,8 +3561,7 @@ struct SettingsView: View {
                     .font(.system(size: 12))
                     .foregroundColor(Palette.ink)
             }
-            .toggleStyle(.switch)
-            .controlSize(.small)
+            .toggleStyle(DayPlanSwitchStyle())
 
             HStack(spacing: 8) {
                 Text(L.versionLine(AppVersion.current, updates.lastUpdatedText ?? L.neverUpdated))

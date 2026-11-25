@@ -30,3 +30,17 @@
 1. 首次启动 → plist 生成，`launchctl print gui/501/io.github.peberwang.dayplan` 可见，`launchctl kickstart` 成功。
 2. 设置里关掉 → 文件消失、`defaults read ... launchAtLogin` 为 0、服务查不到。
 3. 再打开 → 文件回来、值为 1、服务重新 bootstrap。
+
+## 0.13.1 — 开关的「开」必须一眼看出来
+
+系统 `.switch` 的打开色跟着系统强调色走。用户把强调色设成石墨灰时，开和关几乎一样；试过
+`.tint(Palette.switchOn)`，首次渲染是蓝的，但设置里切一次浅色/深色就掉回系统灰。
+
+所以换成自绘的 `DayPlanSwitchStyle`：
+
+- 轨道 36 × 21 胶囊，开 → `Palette.switchOn`（浅色 #2F6FD0 / 深色 #4C8FE8），关 → `Palette.switchOn`
+  的对位灰（#D8D4CC / #4A4741）
+- 白色圆钮带一点投影，开在右、关在左，0.16 秒 easeOut
+- 两种外观切换后颜色都正确刷新（动态色画在 Shape 里，不走 tint）
+
+已验证：深色开/关、浅色开/关、浅→深来回切换后仍是蓝，四张截图逐一核对。
